@@ -260,6 +260,7 @@ const G={
   score:0,bestDrift:0,bestCombo:0,driftCnt:0,nmCnt:0,coinsEarned:0,coinProg:0,
   // physics
   px:0,pz:0,heading:0,speed:0,latV:0,grip:1,handbrake:false,
+  vx:0,vz:0,yawRate:0,rearGrip:1,
   spinout:false,spinT:0,tireWear:1,driftAngle:0,gear:1,rpm:0,
   // drift scoring
   drifting:false,dScore:0,dDur:0,dMult:1,dEndT:0,combo:0,
@@ -821,60 +822,92 @@ function tickSmoke(dt){
 }
 
 // ═══════════════════════════════════════════════════════════
-// PHYSICS (realistic car model)
+// PHYSICS (bicycle model — world velocity vector)
 // ═══════════════════════════════════════════════════════════
 function physTick(dt){
   if(!G.running||G.paused)return;
   const car=CARS[G.selCar];
   const max=car.topSpd;
 
+  // ── spinout recovery ──────────────────────────────────────
   if(G.spinout){
-    G.spinT-=dt*1000;G.speed*=Math.pow(.93,dt*60);
-    G.heading+=.08*dt*60*(G.latV>0?1:-1);
-    G.px+=Math.sin(G.heading)*G.speed*dt;G.pz+=Math.cos(G.heading)*G.speed*dt;
-    if(G.spinT<=0){G.spinout=false;G.grip=.35;G.latV=0;G.driftAngle=0;}
+    G.spinT-=dt*1000;
+    const absSpd=Math.sqrt(G.vx*G.vx+G.vz*G.vz);
+    G.vx*=Math.pow(.90,dt*60);G.vz*=Math.pow(.90,dt*60);
+    G.yawRate*=Math.pow(.80,dt*60);
+    G.heading+=G.yawRate*dt;
+    G.px+=G.vx*dt;G.pz+=G.vz*dt;
+    G.speed=absSpd;
+    if(G.spinT<=0){G.spinout=false;G.rearGrip=.35;G.driftAngle=0;}
     return;
   }
 
+  // ── inputs ────────────────────────────────────────────────
   const steer=(In.rt()?1:0)-(In.lt()?1:0);
   G.handbrake=In.hb();
-  const sr=Math.min(Math.abs(G.speed)/max,1);
 
-  // grip model
-  if(G.handbrake){G.grip=Math.max(.03,G.grip-.09*dt*60);}
-  else{const rg=car.hb*.055*(.6+G.tireWear*.4);G.grip=Math.min(1,G.grip+rg*dt*60);}
+  // ── decompose velocity into car frame ─────────────────────
+  const sinH=Math.sin(G.heading),cosH=Math.cos(G.heading);
+  let fwdSpd= G.vx*sinH+G.vz*cosH;   // + = forward
+  let latSpd= G.vx*cosH-G.vz*sinH;   // + = rightward
 
-  // throttle/brake
-  if(In.fwd())G.speed=Math.min(G.speed+car.acc*dt*60*(1-.15*sr),max);
-  else if(In.bk())G.speed=Math.max(G.speed-car.brk*dt*60,-max*.3);
-  else G.speed*=Math.pow(.978,dt*60);
+  const absSpd=Math.sqrt(G.vx*G.vx+G.vz*G.vz);
+  const sr=Math.min(absSpd/max,1);
 
-  // weight transfer -> lateral
-  const steerPow=car.steer*(1-sr*.42)*(1+G.driftAngle*.002);
-  const latForce=steer*Math.abs(G.speed)*steerPow*(1.1-G.grip*.6);
-  G.latV+=latForce*dt*60;
-  // lateral damping (tire friction)
-  G.latV*=Math.pow(Math.max(.01,1-G.grip*car.gR*8*dt),1);
-  G.latV=Math.max(-Math.abs(G.speed)*.92,Math.min(Math.abs(G.speed)*.92,G.latV));
+  // ── throttle / brake (act on forward component) ───────────
+  if(In.fwd())fwdSpd=Math.min(fwdSpd+car.acc*dt*60*(1-.15*sr),max);
+  else if(In.bk())fwdSpd=Math.max(fwdSpd-car.brk*dt*60,-max*.28);
+  else fwdSpd*=Math.pow(.982,dt*60);
 
-  // drift angle
-  G.driftAngle=Math.abs(G.speed)>1?Math.atan2(G.latV,Math.abs(G.speed))*180/Math.PI:G.driftAngle*.88;
+  // ── front grip: strongly corrects lateral slip ────────────
+  const frontGrip=car.gF*(.6+G.tireWear*.4);
+  const frontCorr=frontGrip*12.0;
+  latSpd*=Math.pow(Math.max(0,1-frontCorr*dt),1);
 
-  // spinout threshold
-  if(Math.abs(G.driftAngle)>76&&Math.abs(G.speed)>7){
-    G.spinout=true;G.spinT=1400;Sc.onSpin();doFlash('#ff000033');
+  // ── rear grip: weakened by handbrake, allows sliding ──────
+  if(G.handbrake){G.rearGrip=Math.max(.04,G.rearGrip-.12*dt*60);}
+  else{G.rearGrip=Math.min(1,G.rearGrip+car.hb*.07*(.6+G.tireWear*.4)*dt*60);}
+
+  const rearCorr=car.gR*G.rearGrip*9.0;
+  latSpd*=Math.pow(Math.max(0,1-rearCorr*dt),1);
+
+  // ── steering adds yaw torque ──────────────────────────────
+  const steerAng=car.steer*(1-sr*.38)*steer;
+  G.yawRate+=steerAng*Math.max(absSpd,1)*dt*60*.55;
+
+  // ── oversteer: grip imbalance generates extra yaw ─────────
+  // front corrects more than rear → yaw in slip direction
+  const gripImbalance=(frontGrip-car.gR*G.rearGrip)*Math.abs(latSpd)*absSpd*.004;
+  G.yawRate+=gripImbalance*(latSpd<0?-1:1)*dt*60;
+
+  // ── yaw damping ───────────────────────────────────────────
+  G.yawRate*=Math.pow(.78,dt*60);
+
+  // ── apply yaw ─────────────────────────────────────────────
+  G.heading+=G.yawRate*dt;
+
+  // ── rebuild world velocity from corrected car-frame vals ──
+  const sinH2=Math.sin(G.heading),cosH2=Math.cos(G.heading);
+  G.vx=fwdSpd*sinH2+latSpd*cosH2;
+  G.vz=fwdSpd*cosH2-latSpd*sinH2;
+
+  // ── integrate position ────────────────────────────────────
+  G.px+=G.vx*dt;
+  G.pz+=G.vz*dt;
+
+  // ── convenience scalars for HUD/scoring ──────────────────
+  G.speed=Math.sqrt(G.vx*G.vx+G.vz*G.vz)*(fwdSpd<0?-1:1);
+  G.latV=latSpd;
+  G.driftAngle=absSpd>1?Math.atan2(latSpd,Math.max(absSpd,.01))*180/Math.PI:G.driftAngle*.88;
+
+  // ── spinout threshold ─────────────────────────────────────
+  if(Math.abs(G.driftAngle)>72&&absSpd>8){
+    G.spinout=true;G.spinT=1200;Sc.onSpin();doFlash('#ff000033');
     const sp=document.getElementById('spin-msg');sp.style.display='block';
     setTimeout(()=>sp.style.display='none',950);
   }
 
-  // yaw
-  G.heading+=(G.latV/Math.max(Math.abs(G.speed),1))*dt*60*.19;
-
-  // integrate
-  G.px+=Math.sin(G.heading)*G.speed*dt;
-  G.pz+=Math.cos(G.heading)*G.speed*dt;
-
-  // wall collision
+  // ── wall collision ────────────────────────────────────────
   const wd=Trk.wdist(G.px,G.pz);
   if(wd<Trk.HW-1.2){
     const ni=Trk.near(G.px,G.pz),tp=Trk.pts[ni];
@@ -882,32 +915,40 @@ function physTick(dt){
     const pd=Trk.HW-1.5;
     if(d>pd){
       G.px=tp.x+dx/d*pd;G.pz=tp.z+dz/d*pd;
-      const impact=Math.abs(G.speed)/max;
-      if(impact>.06){G.shake=impact*9;Snd.hit(impact);G.speed*=.3;G.latV*=.12;Sc.breakCombo();}
+      // reflect velocity off wall normal
+      const nx=dx/d,nz=dz/d;
+      const dot=G.vx*nx+G.vz*nz;
+      const impact=Math.abs(dot)/max;
+      if(impact>.04){
+        G.vx-=dot*nx*1.4;G.vz-=dot*nz*1.4;
+        G.vx*=.45;G.vz*=.45;
+        G.yawRate*=.3;
+        G.shake=impact*11;Snd.hit(impact);Sc.breakCombo();
+      }
     }
   }
 
-  // tyre wear
+  // ── tyre wear ─────────────────────────────────────────────
   if(G.drifting)G.tireWear=Math.max(0,G.tireWear-.000035*dt*60);
 
-  // near miss
+  // ── near miss ─────────────────────────────────────────────
   if(wd<Trk.HW-.5&&wd>Trk.HW-3&&G.drifting)Sc.nearMiss();
 
-  // gears / rpm
+  // ── gears / rpm ───────────────────────────────────────────
   G.gear=Math.max(1,Math.min(6,Math.ceil(sr*6)));G.rpm=sr;
 
-  // brake caliper glow on brake
+  // ── brake caliper glow ────────────────────────────────────
   if(carGrp&&carGrp.userData.wheels){
     carGrp.userData.wheels.forEach(w=>{if(w.userData.caliper)w.userData.caliper.material.emissiveIntensity=In.bk()?1.5:0;});
   }
 
-  // smoke
+  // ── smoke ─────────────────────────────────────────────────
   if(G.drifting&&G.frame%2===0){
     const rx=G.px-Math.sin(G.heading)*3.6,rz=G.pz-Math.cos(G.heading)*3.6;
     spawnSmoke(rx,.3,rz);
   }
 
-  Snd.tick(Math.abs(G.speed),max,Math.abs(G.driftAngle));
+  Snd.tick(absSpd,max,Math.abs(G.driftAngle));
 }
 
 // ═══════════════════════════════════════════════════════════
@@ -1213,7 +1254,7 @@ const UI={
     resetSess();
     Trk.gen(G.selMap);buildScene(G.selMap);
     const sp=Trk.start();G.px=sp.x;G.pz=sp.z;G.heading=sp.h;
-    G.speed=0;G.latV=0;G.grip=1;G.spinout=false;G.tireWear=1;G.driftAngle=0;G.dScore=0;
+    G.speed=0;G.latV=0;G.grip=1;G.vx=0;G.vz=0;G.yawRate=0;G.rearGrip=1;G.spinout=false;G.tireWear=1;G.driftAngle=0;G.dScore=0;
     G.camSmX=G.px-Math.sin(G.heading)*8;G.camSmZ=G.pz-Math.cos(G.heading)*8;G.camSmY=2.5;
     camera.position.set(G.camSmX,G.camSmY,G.camSmZ);camera.lookAt(G.px,.5,G.pz);
     G.running=true;G.paused=false;G.t=0;G.frame=0;G.weatherT=0;
